@@ -61,20 +61,36 @@ class TradingEngine:
     @staticmethod
     def _normalize_side(action: Optional[str]) -> str:
         label = (action or '').upper()
-        if 'BUY' in label or label in {'LONG', 'BULLISH'}:
+        if 'BUY' in label or label in {'LONG', 'BULLISH'} or 'BULL' in label:
             return 'BUY'
-        if 'SELL' in label or label in {'SHORT', 'BEARISH'}:
+        if 'SELL' in label or label in {'SHORT', 'BEARISH'} or 'BEAR' in label:
             return 'SELL'
         return 'BUY' if 'LONG' in label else 'SELL'
+
+    @staticmethod
+    def _normalize_signal_action(action: Optional[str]) -> str:
+        label = (action or '').upper().replace(' ', '_')
+        if label in {'BULLISH', 'BUY', 'LONG', 'BULL'}:
+            return 'BULLISH'
+        if label in {'BEARISH', 'SELL', 'SHORT', 'BEAR'}:
+            return 'BEARISH'
+        if label in {'HEDGE', 'RISK_OFF', 'PROTECTIVE_PUT'}:
+            return 'HEDGE'
+        if label in {'EXIT', 'CLOSE'}:
+            return 'EXIT'
+        if label in {'NO_TRADE', 'NO TRADE'}:
+            return 'NO_TRADE'
+        return label if label else 'NO_TRADE'
 
     def handle_tick(self, tick: MarketTick) -> Optional[PaperOrder]:
         self.last_ticks[tick.instrument_key] = tick
         self.market_state.update_tick(tick)
         snapshot = self.market_state.get_snapshot()
-        snapshot['NIFTY'] = float(tick.ltp)
-        snapshot['India VIX'] = float(snapshot.get('India VIX', snapshot.get('INDIA_VIX', 0.0)))
+        snapshot['history'] = self.market_state.get_history_map()
 
         sig = self.strategy.generate_signal(snapshot)
+        normalized_action = self._normalize_signal_action(getattr(sig, 'action', None))
+        sig.action = normalized_action
         log.info('Strategy signal: %s score=%.3f reasons=%s', sig.action, sig.score, getattr(sig, 'reasons', None))
 
         plan_payload = getattr(sig, 'payload', {}) or {}
@@ -162,10 +178,7 @@ class TradingEngine:
         if option_structure_requested and option_structure_failed and not option_structure_data_missing:
             return None
 
-        if sig.action == 'NO TRADE':
-            return None
-
-        if sig.action == 'NO TRADE':
+        if sig.action in {'NO_TRADE', 'NO TRADE'}:
             return None
 
         risk = self._risk_metrics(snapshot)

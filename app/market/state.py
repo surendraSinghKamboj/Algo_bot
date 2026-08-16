@@ -49,6 +49,7 @@ class MarketState:
 
     def __init__(self):
         self._instruments: dict[str, MarketInstrumentState] = {}
+        self._history: dict[str, list[float]] = {}
 
     def update_tick(self, tick: Any) -> MarketInstrumentState:
         if isinstance(tick, dict):
@@ -84,6 +85,12 @@ class MarketState:
                 state.timestamp = state.timestamp.replace(tzinfo=timezone.utc)
             state.stale_seconds = (datetime.now(timezone.utc) - state.timestamp).total_seconds()
         self._instruments[instrument_key] = state
+        series = self._history.setdefault(symbol, [])
+        if not series or abs(series[-1] - ltp) > 1e-9:
+            series.append(ltp)
+        if len(series) > 200:
+            series = series[-200:]
+        self._history[symbol] = series
         return state
 
     def _symbol_for_key(self, instrument_key: str) -> str:
@@ -92,6 +99,12 @@ class MarketState:
 
     def get_instrument(self, instrument_key: str) -> MarketInstrumentState | None:
         return self._instruments.get(instrument_key)
+
+    def get_series(self, symbol: str) -> list[float]:
+        return list(self._history.get(symbol, []))
+
+    def get_history_map(self) -> dict[str, list[float]]:
+        return {symbol: list(values) for symbol, values in self._history.items()}
 
     def get_snapshot(self) -> dict[str, float]:
         snapshot: dict[str, float] = {**self.DEFAULTS}
@@ -107,6 +120,7 @@ class MarketState:
         snapshot["Silver"] = snapshot.get("SILVER", self.DEFAULTS['SILVER'])
         snapshot["Crude"] = snapshot.get("CRUDE", self.DEFAULTS['CRUDE'])
         snapshot["USDINR"] = snapshot.get("USDINR", self.DEFAULTS['USDINR'])
+        snapshot["history"] = self.get_history_map()
         snapshot["trading_mode"] = "PAPER"
         return snapshot
 
