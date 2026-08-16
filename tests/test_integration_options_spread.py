@@ -57,25 +57,41 @@ def test_end_to_end_bull_call_spread(tmp_path, monkeypatch):
     buy_inst = make_instrument(underlying_key, buy_strike, expiry, "CE", lot_size=50)
     sell_inst = make_instrument(underlying_key, sell_strike, expiry, "CE", lot_size=50)
 
-    # persist instruments using a local in-memory SQLite engine so tests don't hit Postgres
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    from app.database.models import Base
+    # Instead of persisting to DB, monkeypatch instrument lookup helpers to return predictable objects
+    from app.market import instrument_lookup
 
-    engine_local = create_engine('sqlite:///:memory:')
-    Base.metadata.create_all(engine_local)
-    LocalSession = sessionmaker(bind=engine_local)
-    instruments = [inst_under, buy_inst, sell_inst]
-    with LocalSession() as s:
-        upsert_instruments(s, instruments)
-        # insert recent ticks for underlying and options
-        from app.data.models import MarketTick
+    class FakeInstr:
+        def __init__(self, instrument_key, lot_size):
+            self.instrument_key = instrument_key
+            self.lot_size = lot_size
+            self.trading_symbol = instrument_key
 
-        ticks = []
-        ticks.append(MarketTick(instrument_key=underlying_key, timestamp=datetime.utcnow(), ltp=Decimal("17600"), volume=1000, open_interest=0, source="test"))
-        ticks.append(MarketTick(instrument_key=buy_inst["instrument_key"], timestamp=datetime.utcnow(), ltp=Decimal("18.0"), volume=100, open_interest=0, source="test"))
-        ticks.append(MarketTick(instrument_key=sell_inst["instrument_key"], timestamp=datetime.utcnow(), ltp=Decimal("8.0"), volume=120, open_interest=0, source="test"))
-        upsert_ticks(s, ticks)
+    def fake_nearest_expiry(session, underlying_key):
+        return expiry
+
+    def fake_resolve(session, underlying_key, expiry_dt, strike, right):
+        # return matching fake instrument for provided strike
+        if int(strike) == buy_strike:
+            return FakeInstr(buy_inst["instrument_key"], buy_inst["lot_size"])
+        if int(strike) == sell_strike:
+            return FakeInstr(sell_inst["instrument_key"], sell_inst["lot_size"])
+        return None
+
+    def fake_get_latest_tick(session, instrument_key):
+        class T:
+            def __init__(self, ltp):
+                self.ltp = ltp
+        if instrument_key == buy_inst["instrument_key"]:
+            return T(Decimal("18.0"))
+        if instrument_key == sell_inst["instrument_key"]:
+            return T(Decimal("8.0"))
+        if instrument_key == underlying_key:
+            return T(Decimal("17600"))
+        return None
+
+    monkeypatch.setattr(instrument_lookup, "nearest_expiry_for_underlying", fake_nearest_expiry)
+    monkeypatch.setattr(instrument_lookup, "resolve_option_by_strike", fake_resolve)
+    monkeypatch.setattr(instrument_lookup, "get_latest_tick_for_instrument", fake_get_latest_tick)
 
     # build engine and runner with mock feed
     engine = TradingEngine()
