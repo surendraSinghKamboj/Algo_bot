@@ -25,17 +25,44 @@ class PositionLedger:
             raise ValueError("quantity must be positive")
         side = side.upper()
         position = self.positions.setdefault(instrument_key, PositionEntry(instrument_key=instrument_key))
+
         if side == "BUY":
-            total_cost = position.average_price * position.quantity + price * quantity
-            new_quantity = position.quantity + quantity
-            position.average_price = total_cost / new_quantity if new_quantity else 0.0
-            position.quantity = new_quantity
-            self.cash -= price * quantity
+            if position.quantity >= 0:
+                total_cost = position.average_price * max(position.quantity, 0) + price * quantity
+                new_quantity = position.quantity + quantity
+                position.quantity = new_quantity
+                position.average_price = total_cost / max(new_quantity, 1) if new_quantity else 0.0
+                self.cash -= price * quantity
+            else:
+                short_qty = abs(position.quantity)
+                close_qty = min(short_qty, quantity)
+                remaining_short = short_qty - close_qty
+                if remaining_short > 0:
+                    position.quantity = -remaining_short
+                    position.average_price = max(0.0, position.average_price)
+                else:
+                    position.quantity = quantity - close_qty
+                    position.average_price = price if position.quantity > 0 else 0.0
+                self.cash -= price * (quantity - close_qty)
         elif side == "SELL":
-            position.quantity = max(0, position.quantity - quantity)
-            if position.quantity == 0:
-                position.average_price = 0.0
-            self.cash += price * quantity
+            if position.quantity <= 0:
+                short_qty = abs(position.quantity)
+                total_cost = position.average_price * max(short_qty, 0) + price * quantity
+                new_quantity = position.quantity - quantity
+                position.quantity = new_quantity
+                position.average_price = total_cost / max(abs(new_quantity), 1) if new_quantity else 0.0
+                self.cash += price * quantity
+            else:
+                long_qty = position.quantity
+                close_qty = min(long_qty, quantity)
+                remaining_long = long_qty - close_qty
+                if remaining_long > 0:
+                    position.quantity = remaining_long
+                    position.average_price = max(0.0, position.average_price)
+                else:
+                    position.quantity = -(quantity - close_qty)
+                    position.average_price = price if position.quantity < 0 else 0.0
+                self.cash += price * quantity
         else:
             raise ValueError("side must be BUY or SELL")
 
@@ -46,11 +73,19 @@ class PositionLedger:
             "side": side,
         })
 
-    def portfolio_value(self) -> float:
+    def portfolio_value(self, mark_prices: dict[str, float] | None = None) -> float:
         total = self.cash
         for position in self.positions.values():
-            total += position.quantity * position.average_price
+            mark = float(mark_prices.get(position.instrument_key, position.average_price)) if mark_prices else position.average_price
+            total += position.quantity * mark
         return total
 
-    def net_pnl(self) -> float:
-        return self.portfolio_value() - self.starting_cash
+    def unrealized_pnl(self, mark_prices: dict[str, float] | None = None) -> float:
+        total = 0.0
+        for position in self.positions.values():
+            mark = float(mark_prices.get(position.instrument_key, position.average_price)) if mark_prices else position.average_price
+            total += (mark - position.average_price) * position.quantity
+        return total
+
+    def net_pnl(self, mark_prices: dict[str, float] | None = None) -> float:
+        return self.portfolio_value(mark_prices=mark_prices) - self.starting_cash
