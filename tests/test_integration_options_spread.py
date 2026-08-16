@@ -94,6 +94,43 @@ def test_end_to_end_bull_call_spread(tmp_path, monkeypatch):
     monkeypatch.setattr(instrument_lookup, "get_latest_tick_for_instrument", fake_get_latest_tick)
 
     # build engine and runner with mock feed
+    # Prevent DB calls from the engine during tests by stubbing SessionLocal and storage used by the engine
+    class DummySession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr('app.database.session.SessionLocal', DummySession)
+
+    # fake storage module with required no-op functions used in trading flow
+    class FakeStorage:
+        @staticmethod
+        def store_signal(session, **kwargs):
+            return None
+
+        @staticmethod
+        def create_order_record(session, **kwargs):
+            class R:
+                id = None
+
+            return R()
+
+        @staticmethod
+        def update_order_fill(session, **kwargs):
+            return None
+
+        @staticmethod
+        def upsert_position_record(session, **kwargs):
+            return None
+
+        @staticmethod
+        def store_portfolio_snapshot(session, **kwargs):
+            return None
+
+    monkeypatch.setattr('app.engine.trading_engine_fixed.storage', FakeStorage)
+
     engine = TradingEngine()
     runner = Runner(engine=engine, streamer_factory=lambda: MockStreamer())
 
