@@ -3,6 +3,8 @@
 import logging
 import signal
 import sys
+import threading
+import time
 
 from app.config.settings import get_settings
 from app.engine.runner import Runner
@@ -23,16 +25,17 @@ def main() -> int:
     print(f'Mode: {mode}')
     print('Broker: UPSTOX')
     print(f'Strategy: {strategy_name}')
-    print(f'Capital: ₹{capital:,.0f}')
+    print(f'Capital: Rs {capital:,.0f}')
     print('Status: STARTING')
 
     engine = TradingEngine()
     runner = Runner(engine=engine)
+    shutdown_event = threading.Event()
 
     def _shutdown(signum, frame):
         log.info('Shutting down due to signal %s', signum)
+        shutdown_event.set()
         runner.stop()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -40,10 +43,12 @@ def main() -> int:
     try:
         runner.start()
         print('[INFO] Runner started. Press Ctrl+C to stop.')
-        signal.pause()
+        while not shutdown_event.is_set():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print('Interrupted; shutting down')
         runner.stop()
+        shutdown_event.set()
     return 0
 
 

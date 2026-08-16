@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from app.broker.runtime import build_runtime_feed_config
 from app.broker.upstox_feed import MarketTick, UpstoxMarketFeed
 from app.config.settings import get_settings
 from app.engine.trading_engine import TradingEngine
@@ -59,17 +60,13 @@ class Runner:
         self._streamer_factory = streamer_factory
 
     def start(self) -> None:
-        token = None
-        try:
-            token = self.settings.upstox_access_token.get_secret_value() if self.settings.upstox_access_token else None
-        except Exception:
-            token = None
-
-        instruments = ['NSE_INDEX|Nifty 50', 'NSE_INDEX|India VIX']
-        mode = 'PAPER' if str(self.settings.trading_mode).upper() == 'PAPER' else 'LIVE'
+        runtime_config = build_runtime_feed_config(self.settings)
+        token = runtime_config.token
+        instruments = list(runtime_config.instrument_keys)
+        mode = runtime_config.mode
 
         if token:
-            log.info('Starting UpstoxMarketFeed in %s mode', mode)
+            log.info('Starting UpstoxMarketFeed in %s mode for %s instruments', mode, len(instruments))
             self._feed = UpstoxMarketFeed(token, instruments, mode, on_tick=self._on_tick, on_event=self._on_event)
         else:
             log.info('No Upstox access token configured; using MockStreamer for feed')

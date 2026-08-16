@@ -25,7 +25,7 @@ class MarketInstrumentState:
 
 
 class MarketState:
-    """Centralized, minimal market-state cache for the paper trading runtime."""
+    """Centralized market-state cache for the paper trading runtime."""
 
     DEFAULTS = {
         'NIFTY': 22350.0,
@@ -50,6 +50,8 @@ class MarketState:
     def __init__(self):
         self._instruments: dict[str, MarketInstrumentState] = {}
         self._history: dict[str, list[float]] = {}
+        self._availability: dict[str, bool] = {}
+        self._freshness: dict[str, float] = {}
 
     def update_tick(self, tick: Any) -> MarketInstrumentState:
         if isinstance(tick, dict):
@@ -85,6 +87,8 @@ class MarketState:
                 state.timestamp = state.timestamp.replace(tzinfo=timezone.utc)
             state.stale_seconds = (datetime.now(timezone.utc) - state.timestamp).total_seconds()
         self._instruments[instrument_key] = state
+        self._availability[symbol] = True
+        self._freshness[symbol] = state.stale_seconds if state.stale_seconds is not None else 9999.0
         series = self._history.setdefault(symbol, [])
         if not series or abs(series[-1] - ltp) > 1e-9:
             series.append(ltp)
@@ -106,23 +110,34 @@ class MarketState:
     def get_history_map(self) -> dict[str, list[float]]:
         return {symbol: list(values) for symbol, values in self._history.items()}
 
-    def get_snapshot(self) -> dict[str, float]:
-        snapshot: dict[str, float] = {**self.DEFAULTS}
+    def get_snapshot(self, use_defaults: bool = True) -> dict[str, float]:
+        snapshot: dict[str, float] = {**self.DEFAULTS} if use_defaults else {}
+        freshness: dict[str, float] = {}
+        availability: dict[str, bool] = {}
         for key, instrument_key in self.INSTRUMENT_KEYS.items():
             state = self._instruments.get(instrument_key)
             if state is not None:
                 snapshot[key] = float(state.ltp)
-        snapshot["NIFTY"] = snapshot.get("NIFTY", self.DEFAULTS['NIFTY'])
-        snapshot["BANKNIFTY"] = snapshot.get("BANKNIFTY", self.DEFAULTS['BANKNIFTY'])
-        snapshot["India VIX"] = snapshot.get("INDIA_VIX", self.DEFAULTS['INDIA_VIX'])
-        snapshot["india_vix"] = snapshot.get("INDIA_VIX", self.DEFAULTS['INDIA_VIX'])
-        snapshot["Gold"] = snapshot.get("GOLD", self.DEFAULTS['GOLD'])
-        snapshot["Silver"] = snapshot.get("SILVER", self.DEFAULTS['SILVER'])
-        snapshot["Crude"] = snapshot.get("CRUDE", self.DEFAULTS['CRUDE'])
-        snapshot["USDINR"] = snapshot.get("USDINR", self.DEFAULTS['USDINR'])
+                availability[key] = True
+                freshness[key] = float(state.stale_seconds if state.stale_seconds is not None else 0.0)
+            else:
+                snapshot[key] = self.DEFAULTS.get(key, 0.0) if use_defaults else 0.0
+                availability[key] = False
+                freshness[key] = 9999.0
+
+        snapshot["NIFTY"] = float(snapshot.get("NIFTY", self.DEFAULTS['NIFTY']))
+        snapshot["BANKNIFTY"] = float(snapshot.get("BANKNIFTY", self.DEFAULTS['BANKNIFTY']))
+        snapshot["India VIX"] = float(snapshot.get("INDIA_VIX", self.DEFAULTS['INDIA_VIX']))
+        snapshot["india_vix"] = float(snapshot.get("INDIA_VIX", self.DEFAULTS['INDIA_VIX']))
+        snapshot["Gold"] = float(snapshot.get("GOLD", self.DEFAULTS['GOLD']))
+        snapshot["Silver"] = float(snapshot.get("SILVER", self.DEFAULTS['SILVER']))
+        snapshot["Crude"] = float(snapshot.get("CRUDE", self.DEFAULTS['CRUDE']))
+        snapshot["USDINR"] = float(snapshot.get("USDINR", self.DEFAULTS['USDINR']))
         snapshot["history"] = self.get_history_map()
+        snapshot["freshness"] = freshness
+        snapshot["availability"] = availability
         snapshot["trading_mode"] = "PAPER"
         return snapshot
 
     def snapshot(self) -> dict[str, float]:
-        return self.get_snapshot()
+        return self.get_snapshot(use_defaults=True)

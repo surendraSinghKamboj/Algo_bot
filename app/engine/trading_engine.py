@@ -1,12 +1,13 @@
 ﻿from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
 from app.broker.upstox_feed import MarketTick
 from app.data import storage
+from app.options.greeks import calculate_option_greeks
 from app.engine.hedge import compute_hedge_quantity
 from app.engine.pipeline import TradePipeline
 from app.execution.paper import PaperExecutionEngine, PaperLeg, PaperOrder
@@ -40,7 +41,13 @@ class TradingEngine:
         return prices
 
     def _risk_metrics(self, snapshot: dict):
-        prices = self._market_prices_from_snapshot(snapshot)
+        availability = snapshot.get('availability', {}) or {}
+        prices: dict[str, float] = {}
+        for key in ('NIFTY', 'BANKNIFTY', 'INDIA_VIX', 'GOLD', 'SILVER', 'CRUDE', 'USDINR'):
+            if availability.get(key, False):
+                value = snapshot.get(key, snapshot.get(key.lower(), 0.0))
+                if value is not None and float(value) > 0:
+                    prices[key] = float(value)
         portfolio_value = self.ledger.portfolio_value(mark_prices=prices)
         net_pnl = self.ledger.net_pnl(mark_prices=prices)
         drawdown = max(0.0, (self.starting_cash - portfolio_value) / max(1.0, self.starting_cash))
@@ -56,6 +63,7 @@ class TradingEngine:
             'weekly_loss': float(weekly_loss),
             'drawdown': float(drawdown),
             'correlated_exposure': float(correlated_exposure),
+            'portfolio_value': float(portfolio_value),
         }
 
     @staticmethod
@@ -81,6 +89,148 @@ class TradingEngine:
         if label in {'NO_TRADE', 'NO TRADE'}:
             return 'NO_TRADE'
         return label if label else 'NO_TRADE'
+
+    @staticmethod
+    def _quote_is_valid(quote, stale_seconds: float = 30.0) -> bool:
+        if quote is None:
+            return False
+        ltp = float(getattr(quote, 'ltp', 0.0) or 0.0)
+        if ltp <= 0:
+            return False
+        observed = getattr(quote, 'observed_at', None) or getattr(quote, 'timestamp', None)
+        if observed is None:
+            return True
+        if getattr(observed, 'tzinfo', None) is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - observed).total_seconds() > stale_seconds:
+            return False
+        return True
+
+    @staticmethod
+    def _option_trade_metrics(structure: str, *, spot: float, buy_strike: float, sell_strike: float | None, buy_price: float, sell_price: float | None, lot_size: int, expiry_dt: datetime) -> dict:
+        buy_greeks = calculate_option_greeks(option_type='CALL' if structure in {'BULL_CALL_SPREAD', 'PROTECTIVE_PUT'} else 'PUT', spot=spot, strike=float(buy_strike), time_to_expiry=max((expiry_dt - datetime.now(timezone.utc)).total_seconds() / 31557600.0, 1e-4), risk_free_rate=0.05, volatility=0.18)
+        buy_delta = float(buy_greeks.delta)
+        if sell_price is not None and sell_strike is not None:
+            sell_type = 'CALL' if structure == 'BULL_CALL_SPREAD' else 'PUT'
+            sell_greeks = calculate_option_greeks(option_type=sell_type, spot=spot, strike=float(sell_strike), time_to_expiry=max((expiry_dt - datetime.now(timezone.utc)).total_seconds() / 31557600.0, 1e-4), risk_free_rate=0.05, volatility=0.18)
+            sell_delta = float(sell_greeks.delta)
+        else:
+            sell_delta = 0.0
+
+        if structure == 'BULL_CALL_SPREAD':
+            net_debit = (buy_price - sell_price) * lot_size if sell_price is not None else buy_price * lot_size
+            max_loss = max(0.0, net_debit)
+            max_profit = max(0.0, (float(sell_strike) - float(buy_strike) - max(0.0, buy_price - sell_price)) * lot_size)
+            break_even = float(buy_strike) + max(0.0, buy_price - sell_price)
+            delta = buy_delta * lot_size - sell_delta * lot_size
+            hedge_delta = -0.5
+        elif structure == 'BEAR_PUT_SPREAD':
+            net_debit = (buy_price - sell_price) * lot_size if sell_price is not None else buy_price * lot_size
+            max_loss = max(0.0, net_debit)
+            max_profit = max(0.0, (float(buy_strike) - float(sell_strike) - max(0.0, buy_price - sell_price)) * lot_size)
+            break_even = float(sell_strike) - max(0.0, buy_price - sell_price)
+            delta = -abs(buy_delta * lot_size) + abs(sell_delta * lot_size)
+            hedge_delta = 0.5
+        elif structure == 'PROTECTIVE_PUT':
+            max_loss = max(0.0, (float(buy_strike) - spot + buy_price) * lot_size)
+            max_profit = max(0.0, (spot - buy_price) * lot_size)
+            break_even = float(buy_strike) - buy_price
+            delta = buy_delta * lot_size
+            hedge_delta = 0.5
+        else:
+            max_loss = 0.0
+            max_profit = 0.0
+            break_even = 0.0
+            delta = 0.0
+            hedge_delta = 0.0
+
+        hedge_quantity = int(compute_hedge_quantity(exposure_delta=float(delta), hedge_delta=hedge_delta, lot_size=max(1, int(lot_size))) if hedge_delta != 0 else 0)
+        residual_delta = float(delta + (hedge_delta * hedge_quantity))
+        return {
+            'delta': float(delta),
+            'gamma': float(buy_greeks.gamma),
+            'theta': float(buy_greeks.theta),
+            'vega': float(buy_greeks.vega),
+            'max_loss': float(max_loss),
+            'max_profit': float(max_profit),
+            'break_even': float(break_even),
+            'entry_debit': float((buy_price * lot_size) - (sell_price * lot_size if sell_price is not None else 0.0)),
+            'liquidity': 'good' if (sell_price is None or max(0.0, abs(buy_price - sell_price)) < 0.35) else 'poor',
+            'iv': 0.18,
+            'spread_slippage': abs(buy_price - (sell_price if sell_price is not None else buy_price)),
+            'capital_requirement': float((buy_price * lot_size) + (sell_price * lot_size if sell_price is not None else 0.0)),
+            'hedge_delta': float(hedge_delta),
+            'hedge_quantity': int(hedge_quantity),
+            'residual_delta': float(residual_delta),
+            'hedge_cost': float(abs(hedge_quantity) * max(0.0, buy_price if hedge_delta > 0 else (sell_price or buy_price))),
+        }
+
+    def _persist_trade_cycle(self, *, signal, order=None, multi_order=None) -> None:
+        try:
+            from app.config.db import get_database_url
+            from app.database.models import Base, OrderRecord, PositionRecord, SignalRecord
+            from app.database.session import SessionLocal
+
+            if 'postgres' not in get_database_url().lower():
+                return
+            with SessionLocal() as session:
+                try:
+                    Base.metadata.create_all(bind=session.bind)
+                except Exception:
+                    pass
+                if signal is not None:
+                    session.add(SignalRecord(
+                        strategy='NIFTY_HEDGED_V1',
+                        instrument_key=getattr(signal, 'instrument_key', None) or 'NSE_INDEX|Nifty 50',
+                        observed_at=datetime.now(timezone.utc),
+                        action=str(getattr(signal, 'action', 'NO_TRADE')).upper(),
+                        score=float(getattr(signal, 'score', 0.0)),
+                        status='ACTIVE',
+                        explanation=str(getattr(signal, 'reasons', {})),
+                        payload=getattr(signal, 'payload', {}) or {},
+                    ))
+                if order is not None:
+                    session.add(OrderRecord(
+                        client_order_id=f"paper-{int(datetime.now(timezone.utc).timestamp()*1000)}",
+                        trading_mode='PAPER',
+                        instrument_key=order.instrument_key,
+                        side='BUY' if 'BUY' in str(order.action).upper() or 'LONG' in str(order.action).upper() else 'SELL',
+                        quantity=int(order.filled_quantity or order.quantity),
+                        order_type='LIMIT',
+                        status='FILLED',
+                        requested_price=Decimal(str(order.entry_price)),
+                        filled_price=Decimal(str(order.average_fill_price or order.entry_price)),
+                        filled_quantity=int(order.filled_quantity or order.quantity),
+                        estimated_cost=Decimal(str((order.average_fill_price or order.entry_price) * (order.filled_quantity or order.quantity))),
+                        metadata_json={'strategy': order.strategy, 'trade_id': None},
+                    ))
+                if multi_order is not None:
+                    for leg in multi_order.legs:
+                        session.add(OrderRecord(
+                            client_order_id=f"paper-{int(datetime.now(timezone.utc).timestamp()*1000)}-{leg.leg_id}",
+                            trading_mode='PAPER',
+                            instrument_key=leg.instrument_key,
+                            side=leg.side.upper(),
+                            quantity=int(leg.filled_quantity or leg.quantity),
+                            order_type='LIMIT',
+                            status='FILLED',
+                            requested_price=Decimal(str(leg.entry_price)),
+                            filled_price=Decimal(str(leg.average_fill_price or leg.entry_price)),
+                            filled_quantity=int(leg.filled_quantity or leg.quantity),
+                            estimated_cost=Decimal(str((leg.average_fill_price or leg.entry_price) * (leg.filled_quantity or leg.quantity))),
+                            metadata_json={'strategy': multi_order.strategy, 'trade_id': multi_order.trade_id, 'leg_id': leg.leg_id},
+                        ))
+                for instrument_key, position in self.ledger.positions.items():
+                    session.add(PositionRecord(
+                        trading_mode='PAPER',
+                        instrument_key=instrument_key,
+                        quantity=int(position.quantity),
+                        average_price=Decimal(str(position.average_price or 0.0)),
+                        realized_pnl=Decimal(str(0.0)),
+                    ))
+                session.commit()
+        except Exception:
+            log.exception('paper trade persistence failed')
 
     def handle_tick(self, tick: MarketTick) -> Optional[PaperOrder]:
         self.last_ticks[tick.instrument_key] = tick
@@ -109,23 +259,28 @@ class TradingEngine:
                     else:
                         atm = atm_strike_from_spot(float(tick.ltp), strike_step=plan_payload.get('strike_step', 50))
                         structure = plan_payload.get('structure')
+                        width = int(plan_payload.get('width', 200))
+                        lot_size = int(plan_payload.get('lots', 1) or 1)
 
                         if structure == 'BULL_CALL_SPREAD':
                             buy_strike = atm
-                            sell_strike = Decimal(int(atm) + int(plan_payload.get('width', 200)))
+                            sell_strike = Decimal(int(atm) + width)
                             buy_instr = resolve_option_by_strike(session, underlying_key, expiry_dt, buy_strike, 'CE')
                             sell_instr = resolve_option_by_strike(session, underlying_key, expiry_dt, sell_strike, 'CE')
                         elif structure == 'BEAR_PUT_SPREAD':
                             sell_strike = atm
-                            buy_strike = Decimal(int(atm) - int(plan_payload.get('width', 200)))
+                            buy_strike = Decimal(int(atm) - width)
                             buy_instr = resolve_option_by_strike(session, underlying_key, expiry_dt, buy_strike, 'PE')
                             sell_instr = resolve_option_by_strike(session, underlying_key, expiry_dt, sell_strike, 'PE')
                         elif structure == 'PROTECTIVE_PUT':
                             buy_strike = atm
+                            sell_strike = None
                             buy_instr = resolve_option_by_strike(session, underlying_key, expiry_dt, buy_strike, 'PE')
                             sell_instr = None
                         else:
                             option_structure_failed = True
+                            buy_instr = None
+                            sell_instr = None
 
                         if not option_structure_failed and not buy_instr:
                             log.info('No buy instrument found for structure %s', structure)
@@ -136,40 +291,55 @@ class TradingEngine:
 
                         if not option_structure_failed:
                             buy_tick = get_latest_tick_for_instrument(session, buy_instr.instrument_key)
-                            if buy_tick is None:
-                                log.info('Missing quote for %s; NO TRADE', buy_instr.instrument_key)
+                            if not self._quote_is_valid(buy_tick):
+                                log.info('Missing or stale quote for %s; NO TRADE', buy_instr.instrument_key)
                                 option_structure_failed = True
                             else:
                                 buy_price = float(buy_tick.ltp)
+                                sell_price = None
                                 if structure == 'PROTECTIVE_PUT':
-                                    legs = [PaperLeg(leg_id=f'{datetime.now(timezone.utc).timestamp()}-buy', instrument_key=buy_instr.instrument_key, side='BUY', quantity=(buy_instr.lot_size or 1), entry_price=buy_price)]
+                                    legs = [PaperLeg(leg_id=f'{datetime.now(timezone.utc).timestamp()}-buy', instrument_key=buy_instr.instrument_key, side='BUY', quantity=lot_size, entry_price=buy_price)]
                                 else:
                                     sell_tick = get_latest_tick_for_instrument(session, sell_instr.instrument_key)
-                                    if sell_tick is None:
-                                        log.info('Missing quote for %s; NO TRADE', sell_instr.instrument_key)
+                                    if not self._quote_is_valid(sell_tick):
+                                        log.info('Missing or stale quote for %s; NO TRADE', sell_instr.instrument_key)
                                         option_structure_failed = True
                                     else:
                                         sell_price = float(sell_tick.ltp)
                                         legs = [
-                                            PaperLeg(leg_id=f'{datetime.now(timezone.utc).timestamp()}-buy', instrument_key=buy_instr.instrument_key, side='BUY', quantity=(buy_instr.lot_size or 1), entry_price=buy_price),
-                                            PaperLeg(leg_id=f'{datetime.now(timezone.utc).timestamp()}-sell', instrument_key=sell_instr.instrument_key, side='SELL', quantity=(sell_instr.lot_size or 1), entry_price=sell_price),
+                                            PaperLeg(leg_id=f'{datetime.now(timezone.utc).timestamp()}-buy', instrument_key=buy_instr.instrument_key, side='BUY', quantity=lot_size, entry_price=buy_price),
+                                            PaperLeg(leg_id=f'{datetime.now(timezone.utc).timestamp()}-sell', instrument_key=sell_instr.instrument_key, side='SELL', quantity=lot_size, entry_price=sell_price),
                                         ]
-                                        net_cost = sum(leg.entry_price * leg.quantity for leg in legs if leg.side == 'BUY') - sum(leg.entry_price * leg.quantity for leg in legs if leg.side == 'SELL')
-                                        if abs(net_cost) > float(plan_payload.get('max_spread', 5000)):
-                                            log.info('refusing spread with net cost %.2f', net_cost)
+
+                                if not option_structure_failed:
+                                    metrics = self._option_trade_metrics(
+                                        structure,
+                                        spot=float(tick.ltp),
+                                        buy_strike=float(buy_strike),
+                                        sell_strike=float(sell_strike) if sell_strike is not None else None,
+                                        buy_price=buy_price,
+                                        sell_price=sell_price,
+                                        lot_size=lot_size,
+                                        expiry_dt=expiry_dt,
+                                    )
+                                    max_spread = float(plan_payload.get('max_spread', 5000))
+                                    if metrics['max_loss'] <= 0 or metrics['max_profit'] <= 0:
+                                        log.info('Rejected option structure %s: invalid payoff metrics', structure)
+                                        option_structure_failed = True
+                                    elif abs(metrics['entry_debit']) > max_spread:
+                                        log.info('refusing spread with net cost %.2f', metrics['entry_debit'])
+                                        option_structure_failed = True
+                                    else:
+                                        risk = self._risk_metrics(snapshot)
+                                        allowed_risk = 0.02 * self.starting_cash
+                                        if metrics['max_loss'] > allowed_risk:
+                                            log.info('Rejected option structure due to capital risk %.2f > %.2f', metrics['max_loss'], allowed_risk)
                                             option_structure_failed = True
                                         else:
                                             trade_id = f"{sig.action}-{int(datetime.now(timezone.utc).timestamp())}-{datetime.now(timezone.utc).microsecond}"
-                                            self.paper_engine.submit_multi_leg(strategy='NIFTY_HEDGED_V1', trade_id=trade_id, legs=legs)
-                                            for leg in legs:
-                                                self.ledger.apply_fill(instrument_key=leg.instrument_key, quantity=leg.quantity, price=leg.entry_price, side=self._normalize_side(leg.side))
+                                            multi_order = self.paper_engine.submit_multi_leg(strategy='NIFTY_HEDGED_V1', trade_id=trade_id, legs=legs, strategy_id='NIFTY_HEDGED_V1')
+                                            self._persist_trade_cycle(signal=sig, multi_order=multi_order)
                                             return self.paper_engine.orders[-1] if self.paper_engine.orders else None
-                                if not option_structure_failed and structure == 'PROTECTIVE_PUT':
-                                    trade_id = f"{sig.action}-{int(datetime.now(timezone.utc).timestamp())}-{datetime.now(timezone.utc).microsecond}"
-                                    self.paper_engine.submit_multi_leg(strategy='NIFTY_HEDGED_V1', trade_id=trade_id, legs=legs)
-                                    for leg in legs:
-                                        self.ledger.apply_fill(instrument_key=leg.instrument_key, quantity=leg.quantity, price=leg.entry_price, side=self._normalize_side(leg.side))
-                                    return self.paper_engine.orders[-1] if self.paper_engine.orders else None
             except Exception:
                 log.exception('option-structure execution error')
                 option_structure_failed = True
@@ -209,4 +379,5 @@ class TradingEngine:
         order = decision.order
         side = self._normalize_side(getattr(order, 'action', None))
         self.ledger.apply_fill(instrument_key=order.instrument_key, quantity=order.filled_quantity, price=order.average_fill_price or order.entry_price, side=side)
+        self._persist_trade_cycle(signal=sig, order=order)
         return order
